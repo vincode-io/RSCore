@@ -72,9 +72,6 @@ public protocol CloudKitZone: AnyObject, Logging {
 	/// Subscribe to changes at a zone level
 	func subscribeToZoneChanges()
 	
-	/// Process a remove notification
-	func receiveRemoteNotification(userInfo: [AnyHashable : Any], completion: @escaping () -> Void)
-	
 }
 
 public extension CloudKitZone {
@@ -130,14 +127,14 @@ public extension CloudKitZone {
 		})
 	}
 	
-	func receiveRemoteNotification(userInfo: [AnyHashable : Any], completion: @escaping () -> Void) {
+	func receiveRemoteNotification(userInfo: [AnyHashable : Any], incrementalFetch: Bool = true, completion: @escaping () -> Void) {
 		let note = CKRecordZoneNotification(fromRemoteNotificationDictionary: userInfo)
 		guard note?.recordZoneID?.zoneName == zoneID.zoneName else {
 			completion()
 			return
 		}
 		
-		fetchChangesInZone() { result in
+		fetchChangesInZone(incremental: incrementalFetch) { result in
 			if case .failure(let error) = result {
                 self.logger.error("\(self.zoneID.zoneName, privacy: .public) zone remote notification fetch error: \(error.localizedDescription, privacy: .public)")
 			}
@@ -417,6 +414,7 @@ public extension CloudKitZone {
 			
 			switch CloudKitResult.refine(error) {
 			case .success, .partialFailure:
+				self.logger.debug("Saved \(records.count, privacy: .public) new records.")
 				DispatchQueue.main.async {
 					completion(.success((savedRecords ?? [], deletedRecordIDs ?? [])))
 				}
@@ -756,12 +754,37 @@ public extension CloudKitZone {
 	}
 
 	/// Fetch all the changes in the CKZone since the last time we checked
-    func fetchChangesInZone(completion: @escaping (Result<Void, Error>) -> Void) {
+	func fetchChangesInZone(incremental: Bool = true, completion: @escaping (Result<Void, Error>) -> Void) {
 
-		var savedChangeToken = changeToken
-		
-		var changedRecords = [CKRecord]()
+		var updatedRecords = [CKRecord]()
 		var deletedRecordKeys = [CloudKitRecordKey]()
+		
+		func wasChanged(updated: [CKRecord], deleted: [CloudKitRecordKey], token: CKServerChangeToken?, completion: @escaping (Error?) -> Void) {
+			logger.debug("Received \(updated.count, privacy: .public) updated records and \(deleted.count, privacy: .public) delete requests.")
+
+			let op = CloudKitZoneApplyChangesOperation(delegate: delegate, updated: updated, deleted: deleted, changeToken: token)
+			
+			op.completionBlock = { [weak self] mainThreadOperation in
+				guard let self = self, let zoneOperation = mainThreadOperation as? CloudKitZoneApplyChangesOperation else {
+					completion(nil)
+					return
+				}
+				
+				if let error = zoneOperation.error {
+					completion(error)
+				} else {
+					if let changeToken = zoneOperation.changeToken {
+						self.changeToken = changeToken
+					}
+					completion(nil)
+				}
+			}
+			
+			DispatchQueue.main.async {
+				CloudKitZoneApplyChangesOperation.mainThreadOperationQueue.add(op)
+			}
+			
+		}
 		
 		let zoneConfig = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
 		zoneConfig.previousServerChangeToken = changeToken
@@ -770,11 +793,20 @@ public extension CloudKitZone {
 		op.qualityOfService = Self.qualityOfService
 
         op.recordZoneChangeTokensUpdatedBlock = { zoneID, token, _ in
-			savedChangeToken = token
+			guard incremental else { return }
+			
+			wasChanged(updated: updatedRecords, deleted: deletedRecordKeys, token: token) { error in
+				if let error {
+					op.cancel()
+					completion(.failure(error))
+				}
+			}
+			updatedRecords = [CKRecord]()
+			deletedRecordKeys = [CloudKitRecordKey]()
         }
 
         op.recordChangedBlock = { record in
-			changedRecords.append(record)
+			updatedRecords.append(record)
         }
 
         op.recordWithIDWasDeletedBlock = { recordID, recordType in
@@ -782,10 +814,17 @@ public extension CloudKitZone {
 			deletedRecordKeys.append(recordKey)
         }
 
-        op.recordZoneFetchCompletionBlock = { zoneID ,token, _, _, error in
+        op.recordZoneFetchCompletionBlock = { zoneID ,token, _, finalChange, error in
 			if case .success = CloudKitResult.refine(error) {
-				savedChangeToken = token
+				wasChanged(updated: updatedRecords, deleted: deletedRecordKeys, token: token) { error in
+					if let error {
+						op.cancel()
+						completion(.failure(error))
+					}
+				}
 			}
+			updatedRecords = [CKRecord]()
+			deletedRecordKeys = [CloudKitRecordKey]()
         }
 
         op.fetchRecordZoneChangesCompletionBlock = { [weak self] error in
@@ -796,22 +835,20 @@ public extension CloudKitZone {
 
 			switch CloudKitResult.refine(error) {
 			case .success:
+				let op = CloudKitZoneApplyChangesOperation()
+				
+				op.completionBlock = { _ in
+					completion(.success(()))
+				}
+				
 				DispatchQueue.main.async {
-					self.delegate?.cloudKitDidModify(changed: changedRecords, deleted: deletedRecordKeys) { result in
-						switch result {
-						case .success:
-							self.changeToken = savedChangeToken
-							completion(.success(()))
-						case .failure(let error):
-							completion(.failure(error))
-						}
-					}
+					CloudKitZoneApplyChangesOperation.mainThreadOperationQueue.add(op)
 				}
 			case .zoneNotFound:
 				self.createZoneRecord() { result in
 					switch result {
 					case .success:
-						self.fetchChangesInZone(completion: completion)
+						self.fetchChangesInZone(incremental: incremental, completion: completion)
 					case .failure(let error):
 						DispatchQueue.main.async {
 							completion(.failure(error))
@@ -825,12 +862,12 @@ public extension CloudKitZone {
 			case .retry(let timeToWait):
                 self.logger.error("\(self.zoneID.zoneName, privacy: .public) zone fetch changes retry in \(timeToWait, privacy: .public) seconds.")
 				self.retryIfPossible(after: timeToWait) {
-					self.fetchChangesInZone(completion: completion)
+					self.fetchChangesInZone(incremental: incremental, completion: completion)
 				}
 			case .changeTokenExpired:
 				DispatchQueue.main.async {
 					self.changeToken = nil
-					self.fetchChangesInZone(completion: completion)
+					self.fetchChangesInZone(incremental: incremental, completion: completion)
 				}
 			default:
 				DispatchQueue.main.async {
@@ -842,5 +879,59 @@ public extension CloudKitZone {
 
         database?.add(op)
     }
+	
+}
+
+private class CloudKitZoneApplyChangesOperation: MainThreadOperation {
+	
+	static let mainThreadOperationQueue = MainThreadOperationQueue()
+
+	// MainThreadOperation
+	public var isCanceled = false
+	public var id: Int?
+	public weak var operationDelegate: MainThreadOperationDelegate?
+	public var name: String? = "CloudKitReceiveStatusOperation"
+	public var completionBlock: MainThreadOperation.MainThreadOperationCompletionBlock?
+
+	private weak var delegate: CloudKitZoneDelegate?
+	private var updated: [CKRecord]
+	private var deleted: [CloudKitRecordKey]
+	
+	private(set) var error: Error?
+	private(set) var changeToken: CKServerChangeToken?
+	
+	/// Used to queue up the final success call so that it doesn't happen before we are done processing records
+	init() {
+		updated = []
+		deleted = []
+	}
+	
+	/// Used for regular record processing
+	init(delegate: CloudKitZoneDelegate?, updated: [CKRecord], deleted: [CloudKitRecordKey], changeToken: CKServerChangeToken?) {
+		self.delegate = delegate
+		self.updated = updated
+		self.deleted = deleted
+		self.changeToken = changeToken
+	}
+	
+	func run() {
+		guard let delegate = delegate else {
+			self.operationDelegate?.operationDidComplete(self)
+			return
+		}
+		
+		delegate.cloudKitDidModify(changed: updated, deleted: deleted) { [weak self] result in
+			guard let self = self else { return }
+			
+			switch result {
+			case .success:
+				self.operationDelegate?.operationDidComplete(self)
+			case .failure(let error):
+				self.error = error
+				self.operationDelegate?.cancelOperation(self)
+			}
+		}
+
+	}
 	
 }
