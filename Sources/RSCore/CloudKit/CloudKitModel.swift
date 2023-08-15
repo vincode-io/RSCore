@@ -8,80 +8,85 @@
 import Foundation
 import CloudKit
 
-@propertyWrapper
-public struct CloudKitValue<Value> where Value: Equatable, Value: Codable {
-	
-	public private(set) var clientValue: Value?
-	public var ancestorValue: Value? {
-		return _ancestorValue ?? clientValue
-	}
-	
-	public var wrappedValue: Value? {
-		get { return clientValue }
-		set {
-			if _ancestorValue == nil && clientValue != newValue {
-				_ancestorValue = clientValue
-			}
-			clientValue = newValue
-		}
-	}
-	
-	private enum CodingKeys: String, CodingKey {
-		case clientValue
-		case ancestorValue
-	}
-
-	private var _ancestorValue: Value?
-	
-	public init() {}
-	
-}
-
-extension CloudKitValue: Codable {
-
-	public init(from decoder: Decoder) throws {
-		if let value = try? Value.init(from: decoder) {
-			self.clientValue = value
-			return
-		}
-		
-		let container = try decoder.container(keyedBy: CodingKeys.self)
-		self.clientValue = try? container.decode(Value.self, forKey: .clientValue)
-		self._ancestorValue = try? container.decode(Value.self, forKey: .ancestorValue)
-	}
-
-	public func encode(to encoder: Encoder) throws {
-		var container = encoder.container(keyedBy: CodingKeys.self)
-		try container.encode(clientValue, forKey: .clientValue)
-		try container.encode(_ancestorValue, forKey: .ancestorValue)
-	}
-
-}
-
 public protocol CloudKitModel {
 	
 	typealias CloudKitKeyPath = PartialKeyPath<Self>
 
 	var recordType: String { get }
 	var recordID: CKRecord.ID { get }
-
+	var recordFields: [String: CloudKitKeyPath] { get }
+	var syncMetaData: Data? { get }
+	
 	var clientRecord: CKRecord { get }
 	var ancestorRecord: CKRecord { get }
 
 	func clearAncestorData()
+	
 }
 
 public extension CloudKitModel {
 	
 	var clientRecord: CKRecord {
-		return CKRecord(recordType: recordType, recordID: recordID)
+		var record: CKRecord = {
+			if let syncMetaData = syncMetaData, let record = CKRecord(syncMetaData) {
+				return record
+			} else {
+				return CKRecord(recordType: recordType, recordID: recordID)
+			}
+		}()
+		
+		for recordField in recordFields {
+			guard let cloudKitValue = self[keyPath: recordField.value] as? any CloudKitValueHolder else { continue }
+			assign(&record, key: recordField.key, value: cloudKitValue.clientValue)
+		}
+		
+		return record
 	}
 	
 	var ancestorRecord: CKRecord {
-		return CKRecord(recordType: recordType, recordID: recordID)
+		var record: CKRecord = {
+			if let syncMetaData = syncMetaData, let record = CKRecord(syncMetaData) {
+				return record
+			} else {
+				return CKRecord(recordType: recordType, recordID: recordID)
+			}
+		}()
+		
+		for recordField in recordFields {
+			guard let cloudKitValue = self[keyPath: recordField.value] as? any CloudKitValueHolder else { continue }
+			assign(&record, key: recordField.key, value: cloudKitValue.ancestorValue)
+		}
+		
+		return record
 	}
 	
 	func clearAncestorData() {
 		
 	}
+
+}
+
+private extension CloudKitModel {
+
+//	func assign(_ record: inout CKRecord, key: String, value: Any) {
+//		if let value = value as? CKRecordValueProtocol {
+//			record[key] = value
+//		} else if let value = value as? any Collection<CKRecordValueProtocol> {
+//			record[key] = Array(value)
+//		}
+//	}
+	
+	func assign(_ record: inout CKRecord, key: String, value: some CloudKitValueHolder<CKRecordValueProtocol>, valueKeyPath: CloudKitKeyPath) {
+		guard let recordValue = value as? CKRecordValueProtocol else { assertionFailure() }
+		record[key] = recordValue
+	}
+		
+	func assign<T>(_ record: inout CKRecord, key: String, value: any Collection<T>) where T: CKRecordValueProtocol, T: Codable, T:Equatable, T:Hashable {
+		record[key] = Array(value)
+	}
+		
+//	func assign<T>(_ record: inout CKRecord, key: String, value: T) where T: Codable, T:Equatable {
+//		assertionFailure()
+//	}
+	
 }
